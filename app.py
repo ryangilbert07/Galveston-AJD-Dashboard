@@ -1,19 +1,28 @@
 import sqlite3
 import json
+import os
+from io import BytesIO
+from datetime import datetime
+
 import pandas as pd
 import streamlit as st
 import folium
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 
 DB_PATH = "data/ajds.sqlite"
 
 st.set_page_config(
-    page_title="Galveston District AJD Database",
+    page_title="USACE Galveston District AJD Database",
     layout="wide"
 )
 
 st.title("USACE Galveston District AJD Database")
-st.caption("Approved Jurisdictional Determinations extracted from USACE Galveston District 2026 Basis Forms.")
+
+st.warning(
+    "Unofficial research tool. Data were extracted from publicly available USACE AJD PDFs using OCR and AI-assisted parsing. "
+    "Verify all information against the original PDF before relying on it for regulatory, legal, or permitting decisions."
+)
 
 
 @st.cache_data
@@ -27,7 +36,7 @@ def load_data():
 
     for _, row in raw_df.iterrows():
         try:
-            data = json.loads(row["extracted_json"])
+            data = json.loads(row.get("extracted_json", "{}"))
         except Exception:
             data = {}
 
@@ -47,7 +56,7 @@ def load_data():
             if isinstance(f, dict) and f.get("jurisdictional_status")
         ]))
 
-        jd_id = row["swg_number"]
+        jd_id = row.get("swg_number", "")
 
         try:
             year = jd_id.split("-")[1]
@@ -61,6 +70,9 @@ def load_data():
             str(row.get("non_jurisdictional_features", ""))
         ]).lower()
 
+        fallback_outcome = "Unclear"
+        waters_present = "Unclear"
+
         if "no waters" in combined_text or "dry land" in combined_text:
             fallback_outcome = "No Waters Present"
             waters_present = "No"
@@ -70,9 +82,6 @@ def load_data():
         elif "jurisdictional" in combined_text or "waters of the united states" in combined_text:
             fallback_outcome = "Jurisdictional Waters Present"
             waters_present = "Yes"
-        else:
-            fallback_outcome = "Unclear"
-            waters_present = "Unclear"
 
         determination_outcome = row.get("determination_outcome", "") or fallback_outcome
 
@@ -97,6 +106,25 @@ def load_data():
             primary_basis = "Ditch Analysis"
         else:
             primary_basis = ""
+
+        quality_issues = []
+
+        if not row.get("latitude") or not row.get("longitude"):
+            quality_issues.append("Missing Coordinates")
+
+        if not feature_types:
+            quality_issues.append("No Features Extracted")
+
+        if not row.get("project_name"):
+            quality_issues.append("Missing Project Name")
+
+        if not row.get("prepared_by"):
+            quality_issues.append("Missing Prepared By")
+
+        if not row.get("approved_by"):
+            quality_issues.append("Missing Approved By")
+
+        quality_flag = "Good" if not quality_issues else "; ".join(quality_issues)
 
         records.append({
             "JD ID": jd_id,
@@ -123,6 +151,7 @@ def load_data():
             "PDF Link": row.get("pdf_url", ""),
             "Latitude": row.get("latitude", ""),
             "Longitude": row.get("longitude", ""),
+            "Quality Flag": quality_flag,
             "Full OCR Text": row.get("full_ocr_text", ""),
             "Full Record": row.to_dict()
         })
@@ -146,7 +175,34 @@ def load_data():
     return pd.DataFrame(records), pd.DataFrame(feature_records)
 
 
+def make_excel_download(ajd_df, feature_df):
+    output = BytesIO()
+
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        ajd_df.to_excel(writer, index=False, sheet_name="AJDs")
+        feature_df.to_excel(writer, index=False, sheet_name="Features")
+
+    return output.getvalue()
+
+
+def marker_color(outcome):
+    text = str(outcome).lower()
+
+    if "jurisdictional waters present" in text:
+        return "green"
+    if "non-jurisdictional" in text:
+        return "red"
+    if "no waters" in text:
+        return "gray"
+
+    return "blue"
+
+
 df, features_df = load_data()
+
+if os.path.exists(DB_PATH):
+    db_modified = datetime.fromtimestamp(os.path.getmtime(DB_PATH))
+    st.caption(f"Database last updated: {db_modified.strftime('%Y-%m-%d %H:%M')}")
 
 st.sidebar.header("Filters")
 
@@ -165,6 +221,7 @@ outcome_filter = st.sidebar.multiselect("Determination Outcome", sorted(df["Dete
 waters_filter = st.sidebar.multiselect("Waters Present", sorted(df["Waters Present"].dropna().unique()))
 basis_filter = st.sidebar.multiselect("Primary Determination Basis", sorted([x for x in df["Primary Determination Basis"].dropna().unique() if x]))
 framework_filter = st.sidebar.multiselect("Regulatory Framework", sorted([x for x in df["Regulatory Framework"].dropna().unique() if x]))
+quality_filter = st.sidebar.multiselect("Quality Flag", sorted(df["Quality Flag"].dropna().unique()))
 
 feature_options = sorted(set(
     feature.strip()
@@ -172,6 +229,7 @@ feature_options = sorted(set(
     for feature in str(value).split(",")
     if feature.strip()
 ))
+
 feature_filter = st.sidebar.multiselect("Feature Type", feature_options)
 
 status_options = sorted(set(
@@ -180,6 +238,7 @@ status_options = sorted(set(
     for status in str(value).split(",")
     if status.strip()
 ))
+
 status_filter = st.sidebar.multiselect("Feature Jurisdictional Status", status_options)
 
 applicant_contains = st.sidebar.text_input("Applicant Contains")
@@ -223,6 +282,9 @@ if basis_filter:
 if framework_filter:
     filtered = filtered[filtered["Regulatory Framework"].isin(framework_filter)]
 
+if quality_filter:
+    filtered = filtered[filtered["Quality Flag"].isin(quality_filter)]
+
 if feature_filter:
     filtered = filtered[
         filtered["Feature Type(s)"].apply(lambda x: any(feature in str(x) for feature in feature_filter))
@@ -247,67 +309,21 @@ visible_features = features_df[
     features_df["JD ID"].isin(filtered["JD ID"])
 ] if not features_df.empty else pd.DataFrame()
 
-st.subheader("Summary")
+st.subheader("Summary Metrics")
 
-c1, c2, c3, c4, c5, c6 = st.columns(6)
+c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
 
 c1.metric("AJDs", len(filtered))
 c2.metric("Counties / Parishes", filtered["County"].nunique())
 c3.metric("States", filtered["State"].nunique())
 c4.metric("Extracted Features", len(visible_features))
-c5.metric("Waters Present AJDs", len(filtered[filtered["Waters Present"] == "Yes"]))
+c5.metric("Waters Present", len(filtered[filtered["Waters Present"] == "Yes"]))
 c6.metric("Consultants", filtered["Consultant"].replace("", pd.NA).dropna().nunique())
+c7.metric("Needs Review", len(filtered[filtered["Quality Flag"] != "Good"]))
 
 st.divider()
 
-st.subheader("Analytics")
-
-a1, a2 = st.columns(2)
-
-with a1:
-    st.write("**AJDs by County / Parish**")
-    county_counts = filtered["County"].value_counts().reset_index()
-    county_counts.columns = ["County / Parish", "Count"]
-    st.bar_chart(county_counts.set_index("County / Parish"))
-
-with a2:
-    st.write("**Determination Outcomes**")
-    outcome_counts = filtered["Determination Outcome"].value_counts().reset_index()
-    outcome_counts.columns = ["Outcome", "Count"]
-    st.bar_chart(outcome_counts.set_index("Outcome"))
-
-a3, a4, a5 = st.columns(3)
-
-with a3:
-    st.write("**Top Consultants**")
-    consultant_counts = filtered["Consultant"].replace("", pd.NA).dropna().value_counts().head(10).reset_index()
-    consultant_counts.columns = ["Consultant", "Count"]
-    if not consultant_counts.empty:
-        st.bar_chart(consultant_counts.set_index("Consultant"))
-    else:
-        st.info("No consultant data available.")
-
-with a4:
-    st.write("**Top Preparers**")
-    preparer_counts = filtered["Prepared By"].replace("", pd.NA).dropna().value_counts().head(10).reset_index()
-    preparer_counts.columns = ["Prepared By", "Count"]
-    if not preparer_counts.empty:
-        st.bar_chart(preparer_counts.set_index("Prepared By"))
-    else:
-        st.info("No preparer data available.")
-
-with a5:
-    st.write("**Top Approvers**")
-    approver_counts = filtered["Approved By"].replace("", pd.NA).dropna().value_counts().head(10).reset_index()
-    approver_counts.columns = ["Approved By", "Count"]
-    if not approver_counts.empty:
-        st.bar_chart(approver_counts.set_index("Approved By"))
-    else:
-        st.info("No approver data available.")
-
-st.divider()
-
-st.subheader("Clickable AJD Map")
+st.subheader("AJD Map")
 
 map_df = filtered.copy()
 map_df["lat"] = pd.to_numeric(map_df["Latitude"], errors="coerce")
@@ -318,9 +334,37 @@ if not map_df.empty:
     center_lat = map_df["lat"].mean()
     center_lon = map_df["lon"].mean()
 
-    m = folium.Map(location=[center_lat, center_lon], zoom_start=7, tiles="OpenStreetMap")
+    m = folium.Map(
+        location=[center_lat, center_lon],
+        zoom_start=7,
+        control_scale=True,
+        tiles=None
+    )
+
+    folium.TileLayer(
+        "OpenStreetMap",
+        name="Street Map"
+    ).add_to(m)
+
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="Aerial Imagery"
+    ).add_to(m)
+
+    folium.TileLayer(
+        tiles="https://services.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{z}/{y}/{x}",
+        attr="Esri",
+        name="Aerial Labels",
+        overlay=True,
+        control=True
+    ).add_to(m)
+
+    marker_cluster = MarkerCluster(name="AJD Locations").add_to(m)
 
     for _, row in map_df.iterrows():
+        color = marker_color(row["Determination Outcome"])
+
         popup_html = f"""
         <b>{row['JD ID']}</b><br>
         <b>County:</b> {row['County']}<br>
@@ -330,6 +374,7 @@ if not map_df.empty:
         <b>Approved By:</b> {row['Approved By']}<br>
         <b>Consultant:</b> {row['Consultant']}<br>
         <b>Feature Types:</b> {row['Feature Type(s)']}<br>
+        <b>Quality:</b> {row['Quality Flag']}<br>
         <b>Summary:</b> {row['AI Summary']}<br>
         <a href="{row['PDF Link']}" target="_blank">Open PDF</a>
         """
@@ -339,132 +384,259 @@ if not map_df.empty:
             radius=7,
             popup=folium.Popup(popup_html, max_width=500),
             tooltip=row["JD ID"],
+            color=color,
             fill=True,
+            fill_color=color,
             fill_opacity=0.8
-        ).add_to(m)
+        ).add_to(marker_cluster)
 
-    st_folium(m, width=1200, height=500)
+    folium.LayerControl().add_to(m)
+
+    st_folium(m, width=1400, height=650)
 else:
     st.info("No valid coordinates available for the current filters.")
 
 st.divider()
 
-st.subheader("AJD Table")
+tabs = st.tabs([
+    "Overview",
+    "AJD Table",
+    "Feature Explorer",
+    "Detail View",
+    "Downloads",
+    "About / Methodology"
+])
 
-table_columns = [
-    "JD ID",
-    "Project Name",
-    "County",
-    "State",
-    "Year",
-    "JD Date",
-    "JD Type",
-    "USACE District",
-    "Prepared By",
-    "Approved By",
-    "Applicant",
-    "Consultant",
-    "Feature Type(s)",
-    "Feature Status(es)",
-    "Waters Present",
-    "Determination Outcome",
-    "Primary Determination Basis",
-    "Regulatory Framework",
-    "TNW / Receiving Water",
-    "PDF Link"
-]
+with tabs[0]:
+    st.subheader("Analytics")
 
-st.dataframe(
-    filtered[table_columns],
-    use_container_width=True,
-    hide_index=True,
-    column_config={
-        "PDF Link": st.column_config.LinkColumn("PDF Link")
-    }
-)
+    a1, a2 = st.columns(2)
 
-st.divider()
+    with a1:
+        st.write("### AJDs by County / Parish")
+        county_counts = filtered["County"].value_counts().reset_index()
+        county_counts.columns = ["County / Parish", "Count"]
+        if not county_counts.empty:
+            st.bar_chart(county_counts.set_index("County / Parish"))
 
-st.subheader("Extracted Feature Table")
+    with a2:
+        st.write("### Determination Outcomes")
+        outcome_counts = filtered["Determination Outcome"].value_counts().reset_index()
+        outcome_counts.columns = ["Outcome", "Count"]
+        if not outcome_counts.empty:
+            st.bar_chart(outcome_counts.set_index("Outcome"))
 
-if not visible_features.empty:
+    a3, a4, a5 = st.columns(3)
+
+    with a3:
+        st.write("### Top Consultants")
+        consultant_counts = filtered["Consultant"].replace("", pd.NA).dropna().value_counts().head(10).reset_index()
+        consultant_counts.columns = ["Consultant", "Count"]
+        if not consultant_counts.empty:
+            st.bar_chart(consultant_counts.set_index("Consultant"))
+
+    with a4:
+        st.write("### Top Preparers")
+        preparer_counts = filtered["Prepared By"].replace("", pd.NA).dropna().value_counts().head(10).reset_index()
+        preparer_counts.columns = ["Prepared By", "Count"]
+        if not preparer_counts.empty:
+            st.bar_chart(preparer_counts.set_index("Prepared By"))
+
+    with a5:
+        st.write("### Top Approvers")
+        approver_counts = filtered["Approved By"].replace("", pd.NA).dropna().value_counts().head(10).reset_index()
+        approver_counts.columns = ["Approved By", "Count"]
+        if not approver_counts.empty:
+            st.bar_chart(approver_counts.set_index("Approved By"))
+
+    st.write("### Feature Type Frequency")
+    if not visible_features.empty:
+        feature_counts = visible_features["Feature Type"].replace("", pd.NA).dropna().value_counts().head(20)
+        st.bar_chart(feature_counts)
+    else:
+        st.info("No feature data available.")
+
+with tabs[1]:
+    st.subheader("AJD Table")
+
+    table_columns = [
+        "JD ID",
+        "Project Name",
+        "County",
+        "State",
+        "Year",
+        "JD Date",
+        "JD Type",
+        "USACE District",
+        "Prepared By",
+        "Approved By",
+        "Applicant",
+        "Consultant",
+        "Feature Type(s)",
+        "Feature Status(es)",
+        "Waters Present",
+        "Determination Outcome",
+        "Primary Determination Basis",
+        "Regulatory Framework",
+        "TNW / Receiving Water",
+        "Quality Flag",
+        "PDF Link"
+    ]
+
     st.dataframe(
-        visible_features,
+        filtered[table_columns],
         use_container_width=True,
         hide_index=True,
         column_config={
             "PDF Link": st.column_config.LinkColumn("PDF Link")
         }
     )
-else:
-    st.info("No extracted features found for the current filters.")
 
-st.divider()
+with tabs[2]:
+    st.subheader("Feature Explorer")
 
-st.subheader("Select AJD Detail Card")
-
-if filtered.empty:
-    st.warning("No records match the selected filters.")
-else:
-    selected_jd = st.selectbox(
-        "Select a JD ID to view details",
-        filtered["JD ID"].tolist()
-    )
-
-    selected_row = filtered[filtered["JD ID"] == selected_jd].iloc[0]
-
-    st.write("### Basic Information")
-
-    c1, c2, c3 = st.columns(3)
-
-    with c1:
-        st.write("**JD ID:**", selected_row["JD ID"])
-        st.write("**Project Name:**", selected_row["Project Name"])
-        st.write("**County:**", selected_row["County"])
-        st.write("**State:**", selected_row["State"])
-        st.write("**Year:**", selected_row["Year"])
-        st.write("**JD Date:**", selected_row["JD Date"])
-
-    with c2:
-        st.write("**JD Type:**", selected_row["JD Type"])
-        st.write("**USACE District:**", selected_row["USACE District"])
-        st.write("**Prepared By:**", selected_row["Prepared By"])
-        st.write("**Approved By:**", selected_row["Approved By"])
-        st.write("**Applicant:**", selected_row["Applicant"])
-        st.write("**Consultant:**", selected_row["Consultant"])
-
-    with c3:
-        st.write("**Waters Present:**", selected_row["Waters Present"])
-        st.write("**Determination Outcome:**", selected_row["Determination Outcome"])
-        st.write("**Primary Basis:**", selected_row["Primary Determination Basis"])
-        st.write("**Regulatory Framework:**", selected_row["Regulatory Framework"])
-        st.write("**TNW / Receiving Water:**", selected_row["TNW / Receiving Water"])
-        st.write("**Feature Type(s):**", selected_row["Feature Type(s)"])
-
-    st.write("### AI Summary")
-    st.write(selected_row["AI Summary"])
-
-    st.write("### Jurisdictional Reasoning")
-    st.write(selected_row["Jurisdictional Reasoning"])
-
-    selected_features = visible_features[visible_features["JD ID"] == selected_jd]
-
-    if not selected_features.empty:
-        st.write("### Extracted Features")
+    if not visible_features.empty:
         st.dataframe(
-            selected_features,
+            visible_features,
             use_container_width=True,
             hide_index=True,
             column_config={
                 "PDF Link": st.column_config.LinkColumn("PDF Link")
             }
         )
+    else:
+        st.info("No extracted features found for the current filters.")
 
-    if selected_row["PDF Link"]:
-        st.link_button("Open Original PDF", selected_row["PDF Link"])
+with tabs[3]:
+    st.subheader("Detail View")
 
-    with st.expander("Full OCR Text"):
-        st.write(selected_row["Full OCR Text"])
+    if filtered.empty:
+        st.warning("No records match the selected filters.")
+    else:
+        selected_jd = st.selectbox(
+            "Select a JD ID to view details",
+            filtered["JD ID"].tolist()
+        )
 
-    with st.expander("Full Database Record"):
-        st.json(selected_row["Full Record"])
+        selected_row = filtered[filtered["JD ID"] == selected_jd].iloc[0]
+
+        st.header(selected_row["JD ID"])
+        st.caption(f"{selected_row['County']}, {selected_row['State']} | {selected_row['JD Date']}")
+
+        if selected_row["Waters Present"] == "Yes":
+            st.success(f"Determination Outcome: {selected_row['Determination Outcome']}")
+        elif selected_row["Waters Present"] == "No":
+            st.warning(f"Determination Outcome: {selected_row['Determination Outcome']}")
+        else:
+            st.info(f"Determination Outcome: {selected_row['Determination Outcome']}")
+
+        c1, c2, c3 = st.columns(3)
+
+        with c1:
+            st.write("**Project Name:**", selected_row["Project Name"])
+            st.write("**Applicant:**", selected_row["Applicant"])
+            st.write("**Consultant:**", selected_row["Consultant"])
+            st.write("**USACE District:**", selected_row["USACE District"])
+
+        with c2:
+            st.write("**Prepared By:**", selected_row["Prepared By"])
+            st.write("**Approved By:**", selected_row["Approved By"])
+            st.write("**JD Type:**", selected_row["JD Type"])
+            st.write("**Regulatory Framework:**", selected_row["Regulatory Framework"])
+
+        with c3:
+            st.write("**Primary Basis:**", selected_row["Primary Determination Basis"])
+            st.write("**TNW / Receiving Water:**", selected_row["TNW / Receiving Water"])
+            st.write("**Feature Type(s):**", selected_row["Feature Type(s)"])
+            st.write("**Quality Flag:**", selected_row["Quality Flag"])
+
+        st.write("### AI Summary")
+        st.write(selected_row["AI Summary"])
+
+        st.write("### Jurisdictional Reasoning")
+        st.write(selected_row["Jurisdictional Reasoning"])
+
+        selected_features = visible_features[visible_features["JD ID"] == selected_jd]
+
+        if not selected_features.empty:
+            st.write("### Extracted Features")
+            st.dataframe(
+                selected_features,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "PDF Link": st.column_config.LinkColumn("PDF Link")
+                }
+            )
+
+        if selected_row["PDF Link"]:
+            st.link_button("Open Original PDF", selected_row["PDF Link"])
+
+        with st.expander("Full OCR Text"):
+            st.write(selected_row["Full OCR Text"])
+
+        with st.expander("Full Database Record"):
+            st.json(selected_row["Full Record"])
+
+with tabs[4]:
+    st.subheader("Downloads")
+
+    st.write("Download the currently filtered results.")
+
+    csv_ajds = filtered.drop(columns=["Full Record"], errors="ignore").to_csv(index=False).encode("utf-8")
+
+    st.download_button(
+        label="Download Filtered AJDs as CSV",
+        data=csv_ajds,
+        file_name="filtered_ajds.csv",
+        mime="text/csv"
+    )
+
+    if not visible_features.empty:
+        csv_features = visible_features.to_csv(index=False).encode("utf-8")
+
+        st.download_button(
+            label="Download Filtered Features as CSV",
+            data=csv_features,
+            file_name="filtered_features.csv",
+            mime="text/csv"
+        )
+
+    excel_file = make_excel_download(
+        filtered.drop(columns=["Full Record"], errors="ignore"),
+        visible_features
+    )
+
+    st.download_button(
+        label="Download Filtered AJDs and Features as Excel",
+        data=excel_file,
+        file_name="filtered_ajd_database.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    )
+
+with tabs[5]:
+    st.header("About / Methodology")
+
+    st.markdown(
+        """
+        ### Data Source
+
+        This dashboard is based on publicly available USACE Galveston District Approved Jurisdictional Determination documents.
+
+        ### Processing Method
+
+        Source PDFs were downloaded, OCR processed, and parsed using AI-assisted extraction. Extracted fields include JD ID, county, state, project name, applicant, consultant, USACE reviewer information, feature types, determination outcome, jurisdictional reasoning, and PDF links.
+
+        ### Limitations
+
+        OCR and AI-assisted extraction may produce errors or omissions. The dashboard should be used as a research aid, not as the official jurisdictional determination record.
+
+        ### Recommended Use
+
+        Use this tool for regulatory research, due diligence, trend analysis, and locating similar AJDs. Always open and verify the original PDF before relying on extracted information.
+
+        ### Quality Flags
+
+        Records marked as needing review may have missing coordinates, missing project names, or limited extracted feature information.
+        """
+    )
