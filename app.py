@@ -25,6 +25,121 @@ st.warning(
 )
 
 
+def normalize_text(value):
+    if value is None:
+        return ""
+    value = str(value).strip()
+    if value.lower() in ["none", "null", "nan", "n/a", "na"]:
+        return ""
+    return value
+
+
+def normalize_outcome(value):
+    value = normalize_text(value)
+    text = value.lower()
+
+    if not text:
+        return "Unknown"
+
+    if "no waters" in text or "dry land" in text:
+        return "No Waters Present"
+
+    if "non-jurisdictional" in text or "nonjurisdictional" in text:
+        return "Non-Jurisdictional Features"
+
+    if "jurisdictional waters present" in text:
+        return "Jurisdictional Waters Present"
+
+    if "jurisdictional" in text and "non" not in text:
+        return "Jurisdictional Waters Present"
+
+    return value
+
+
+def normalize_consultant(value):
+    value = normalize_text(value)
+    text = value.lower()
+
+    if not text:
+        return ""
+
+    if "marcia appia" in text:
+        return "Marcia Appia Engineers, LLC"
+
+    if "raba kistner" in text:
+        return "Raba Kistner"
+
+    if "swca" in text:
+        return "SWCA Environmental Consultants"
+
+    if "freese" in text and "nichols" in text:
+        return "Freese and Nichols"
+
+    if "power engineers" in text:
+        return "Power Engineers"
+
+    if "kimley" in text and "horn" in text:
+        return "Kimley-Horn"
+
+    if "dewberry" in text:
+        return "Dewberry Engineers, Inc."
+
+    if "benchmark" in text:
+        return "Benchmark Ecological Services Inc."
+
+    if "harris county flood control" in text:
+        return "Harris County Flood Control District"
+
+    return value
+
+
+def normalize_approved_by(value):
+    value = normalize_text(value)
+    text = value.lower()
+
+    if not text:
+        return ""
+
+    if "andria" in text and "davis" in text:
+        return "Andria Davis"
+
+    if "kara" in text and "vick" in text:
+        return "Kara Vick Clark"
+
+    if "karie" in text and "vick" in text:
+        return "Kara Vick Clark"
+
+    if "marie" in text and "taylor" in text:
+        return "K. Marie Taylor"
+
+    if "matthew" in text and "kimmel" in text:
+        return "Matthew Kimmel"
+
+    if "matther" in text and "kimmel" in text:
+        return "Matthew Kimmel"
+
+    return value
+
+
+def normalize_prepared_by(value):
+    value = normalize_text(value)
+    text = value.lower()
+
+    if not text:
+        return ""
+
+    if "bogrand" in text:
+        return "Ashley Bogard"
+
+    if "avettin" in text or "avertin" in text:
+        return "Avettin Wore"
+
+    if "wiki" in text:
+        return "Avettin Wore"
+
+    return value
+
+
 @st.cache_data
 def load_data():
     conn = sqlite3.connect(DB_PATH)
@@ -45,18 +160,18 @@ def load_data():
             features = []
 
         feature_types = sorted(set([
-            str(f.get("feature_type", "")).strip()
+            normalize_text(f.get("feature_type", ""))
             for f in features
-            if isinstance(f, dict) and f.get("feature_type")
+            if isinstance(f, dict) and normalize_text(f.get("feature_type", ""))
         ]))
 
         statuses = sorted(set([
-            str(f.get("jurisdictional_status", "")).strip()
+            normalize_outcome(f.get("jurisdictional_status", ""))
             for f in features
-            if isinstance(f, dict) and f.get("jurisdictional_status")
+            if isinstance(f, dict) and normalize_text(f.get("jurisdictional_status", ""))
         ]))
 
-        jd_id = row.get("swg_number", "")
+        jd_id = normalize_text(row.get("swg_number", ""))
 
         try:
             year = jd_id.split("-")[1]
@@ -70,7 +185,7 @@ def load_data():
             str(row.get("non_jurisdictional_features", ""))
         ]).lower()
 
-        fallback_outcome = "Unclear"
+        fallback_outcome = "Unknown"
         waters_present = "Unclear"
 
         if "no waters" in combined_text or "dry land" in combined_text:
@@ -83,16 +198,9 @@ def load_data():
             fallback_outcome = "Jurisdictional Waters Present"
             waters_present = "Yes"
 
-        determination_outcome = row.get("determination_outcome", "") or fallback_outcome
-
-        if "pre-2015" in combined_text:
-            fallback_framework = "Pre-2015 Regulatory Regime"
-        elif "sackett" in combined_text:
-            fallback_framework = "Post-Sackett"
-        else:
-            fallback_framework = ""
-
-        regulatory_framework = row.get("regulatory_framework", "") or fallback_framework
+        determination_outcome = normalize_outcome(row.get("determination_outcome", "")) or fallback_outcome
+        if determination_outcome == "Unknown":
+            determination_outcome = fallback_outcome
 
         if "relatively permanent" in combined_text or "rpw" in combined_text:
             primary_basis = "Relatively Permanent Water / RPW"
@@ -107,6 +215,10 @@ def load_data():
         else:
             primary_basis = ""
 
+        consultant = normalize_consultant(row.get("consultant", ""))
+        prepared_by = normalize_prepared_by(row.get("prepared_by", ""))
+        approved_by = normalize_approved_by(row.get("approved_by", ""))
+
         quality_issues = []
 
         if not row.get("latitude") or not row.get("longitude"):
@@ -118,41 +230,40 @@ def load_data():
         if not row.get("project_name"):
             quality_issues.append("Missing Project Name")
 
-        if not row.get("prepared_by"):
+        if not prepared_by:
             quality_issues.append("Missing Prepared By")
 
-        if not row.get("approved_by"):
+        if not approved_by:
             quality_issues.append("Missing Approved By")
 
         quality_flag = "Good" if not quality_issues else "; ".join(quality_issues)
 
         records.append({
             "JD ID": jd_id,
-            "Project Name": row.get("project_name", ""),
-            "County": row.get("county", ""),
-            "State": row.get("state", ""),
+            "Project Name": normalize_text(row.get("project_name", "")),
+            "County": normalize_text(row.get("county", "")),
+            "State": normalize_text(row.get("state", "")),
             "Year": year,
-            "JD Date": row.get("issue_date", ""),
-            "JD Type": row.get("jd_type", ""),
-            "USACE District": row.get("district", "") or "Galveston",
-            "Prepared By": row.get("prepared_by", ""),
-            "Approved By": row.get("approved_by", ""),
-            "Applicant": row.get("applicant", ""),
-            "Consultant": row.get("consultant", ""),
+            "JD Date": normalize_text(row.get("issue_date", "")),
+            "JD Type": normalize_text(row.get("jd_type", "")),
+            "USACE District": normalize_text(row.get("district", "")) or "Galveston",
+            "Prepared By": prepared_by,
+            "Approved By": approved_by,
+            "Applicant": normalize_text(row.get("applicant", "")),
+            "Consultant": consultant,
             "Feature Type(s)": ", ".join(feature_types),
             "Feature Status(es)": ", ".join(statuses),
             "Waters Present": waters_present,
             "Determination Outcome": determination_outcome,
             "Primary Determination Basis": primary_basis,
-            "Regulatory Framework": regulatory_framework,
-            "TNW / Receiving Water": row.get("receiving_water", "") or row.get("nearest_waterbody", ""),
-            "AI Summary": row.get("feature_summary", ""),
-            "Jurisdictional Reasoning": row.get("jurisdictional_reasoning", ""),
-            "PDF Link": row.get("pdf_url", ""),
-            "Latitude": row.get("latitude", ""),
-            "Longitude": row.get("longitude", ""),
+            "TNW / Receiving Water": normalize_text(row.get("receiving_water", "")) or normalize_text(row.get("nearest_waterbody", "")),
+            "AI Summary": normalize_text(row.get("feature_summary", "")),
+            "Jurisdictional Reasoning": normalize_text(row.get("jurisdictional_reasoning", "")),
+            "PDF Link": normalize_text(row.get("pdf_url", "")),
+            "Latitude": normalize_text(row.get("latitude", "")),
+            "Longitude": normalize_text(row.get("longitude", "")),
             "Quality Flag": quality_flag,
-            "Full OCR Text": row.get("full_ocr_text", ""),
+            "Full OCR Text": normalize_text(row.get("full_ocr_text", "")),
             "Full Record": row.to_dict()
         })
 
@@ -160,16 +271,18 @@ def load_data():
             if not isinstance(f, dict):
                 continue
 
+            feature_status = normalize_outcome(f.get("jurisdictional_status", ""))
+
             feature_records.append({
                 "JD ID": jd_id,
-                "County": row.get("county", ""),
-                "State": row.get("state", ""),
-                "Feature ID": f.get("feature_id", ""),
-                "Feature Type": f.get("feature_type", ""),
-                "Jurisdictional Status": f.get("jurisdictional_status", ""),
-                "Basis": f.get("basis", ""),
-                "Reasoning": f.get("reasoning", ""),
-                "PDF Link": row.get("pdf_url", "")
+                "County": normalize_text(row.get("county", "")),
+                "State": normalize_text(row.get("state", "")),
+                "Feature ID": normalize_text(f.get("feature_id", "")),
+                "Feature Type": normalize_text(f.get("feature_type", "")),
+                "Jurisdictional Status": feature_status,
+                "Basis": normalize_text(f.get("basis", "")),
+                "Reasoning": normalize_text(f.get("reasoning", "")),
+                "PDF Link": normalize_text(row.get("pdf_url", ""))
             })
 
     return pd.DataFrame(records), pd.DataFrame(feature_records)
@@ -212,16 +325,7 @@ county_filter = st.sidebar.multiselect("County / Parish", sorted(df["County"].dr
 state_filter = st.sidebar.multiselect("State", sorted(df["State"].dropna().unique()))
 year_filter = st.sidebar.multiselect("Year", sorted(df["Year"].dropna().unique()))
 
-jd_type_filter = st.sidebar.multiselect("JD Type", sorted([x for x in df["JD Type"].dropna().unique() if x]))
-prepared_by_filter = st.sidebar.multiselect("Prepared By", sorted([x for x in df["Prepared By"].dropna().unique() if x]))
-approved_by_filter = st.sidebar.multiselect("Approved By", sorted([x for x in df["Approved By"].dropna().unique() if x]))
-consultant_filter = st.sidebar.multiselect("Consultant", sorted([x for x in df["Consultant"].dropna().unique() if x]))
-
 outcome_filter = st.sidebar.multiselect("Determination Outcome", sorted(df["Determination Outcome"].dropna().unique()))
-waters_filter = st.sidebar.multiselect("Waters Present", sorted(df["Waters Present"].dropna().unique()))
-basis_filter = st.sidebar.multiselect("Primary Determination Basis", sorted([x for x in df["Primary Determination Basis"].dropna().unique() if x]))
-framework_filter = st.sidebar.multiselect("Regulatory Framework", sorted([x for x in df["Regulatory Framework"].dropna().unique() if x]))
-quality_filter = st.sidebar.multiselect("Quality Flag", sorted(df["Quality Flag"].dropna().unique()))
 
 feature_options = sorted(set(
     feature.strip()
@@ -229,7 +333,6 @@ feature_options = sorted(set(
     for feature in str(value).split(",")
     if feature.strip()
 ))
-
 feature_filter = st.sidebar.multiselect("Feature Type", feature_options)
 
 status_options = sorted(set(
@@ -238,11 +341,38 @@ status_options = sorted(set(
     for status in str(value).split(",")
     if status.strip()
 ))
-
 status_filter = st.sidebar.multiselect("Feature Jurisdictional Status", status_options)
 
-applicant_contains = st.sidebar.text_input("Applicant Contains")
-receiving_water_contains = st.sidebar.text_input("TNW / Receiving Water Contains")
+consultant_filter = st.sidebar.multiselect(
+    "Consultant",
+    sorted([x for x in df["Consultant"].dropna().unique() if x])
+)
+
+quality_filter = st.sidebar.multiselect("Quality Flag", sorted(df["Quality Flag"].dropna().unique()))
+
+with st.sidebar.expander("Advanced Filters"):
+    prepared_by_filter = st.multiselect(
+        "Prepared By",
+        sorted([x for x in df["Prepared By"].dropna().unique() if x])
+    )
+
+    approved_by_filter = st.multiselect(
+        "Approved By",
+        sorted([x for x in df["Approved By"].dropna().unique() if x])
+    )
+
+    waters_filter = st.multiselect(
+        "Waters Present",
+        sorted(df["Waters Present"].dropna().unique())
+    )
+
+    basis_filter = st.multiselect(
+        "Primary Determination Basis",
+        sorted([x for x in df["Primary Determination Basis"].dropna().unique() if x])
+    )
+
+    applicant_contains = st.text_input("Applicant Contains")
+    receiving_water_contains = st.text_input("TNW / Receiving Water Contains")
 
 filtered = df.copy()
 
@@ -258,32 +388,8 @@ if state_filter:
 if year_filter:
     filtered = filtered[filtered["Year"].isin(year_filter)]
 
-if jd_type_filter:
-    filtered = filtered[filtered["JD Type"].isin(jd_type_filter)]
-
-if prepared_by_filter:
-    filtered = filtered[filtered["Prepared By"].isin(prepared_by_filter)]
-
-if approved_by_filter:
-    filtered = filtered[filtered["Approved By"].isin(approved_by_filter)]
-
-if consultant_filter:
-    filtered = filtered[filtered["Consultant"].isin(consultant_filter)]
-
 if outcome_filter:
     filtered = filtered[filtered["Determination Outcome"].isin(outcome_filter)]
-
-if waters_filter:
-    filtered = filtered[filtered["Waters Present"].isin(waters_filter)]
-
-if basis_filter:
-    filtered = filtered[filtered["Primary Determination Basis"].isin(basis_filter)]
-
-if framework_filter:
-    filtered = filtered[filtered["Regulatory Framework"].isin(framework_filter)]
-
-if quality_filter:
-    filtered = filtered[filtered["Quality Flag"].isin(quality_filter)]
 
 if feature_filter:
     filtered = filtered[
@@ -294,6 +400,24 @@ if status_filter:
     filtered = filtered[
         filtered["Feature Status(es)"].apply(lambda x: any(status in str(x) for status in status_filter))
     ]
+
+if consultant_filter:
+    filtered = filtered[filtered["Consultant"].isin(consultant_filter)]
+
+if quality_filter:
+    filtered = filtered[filtered["Quality Flag"].isin(quality_filter)]
+
+if prepared_by_filter:
+    filtered = filtered[filtered["Prepared By"].isin(prepared_by_filter)]
+
+if approved_by_filter:
+    filtered = filtered[filtered["Approved By"].isin(approved_by_filter)]
+
+if waters_filter:
+    filtered = filtered[filtered["Waters Present"].isin(waters_filter)]
+
+if basis_filter:
+    filtered = filtered[filtered["Primary Determination Basis"].isin(basis_filter)]
 
 if applicant_contains:
     filtered = filtered[
@@ -311,15 +435,17 @@ visible_features = features_df[
 
 st.subheader("Summary Metrics")
 
-c1, c2, c3, c4, c5, c6, c7 = st.columns(7)
+c1, c2, c3, c4, c5, c6, c7, c8, c9 = st.columns(9)
 
 c1.metric("AJDs", len(filtered))
-c2.metric("Counties / Parishes", filtered["County"].nunique())
+c2.metric("Counties", filtered["County"].nunique())
 c3.metric("States", filtered["State"].nunique())
-c4.metric("Extracted Features", len(visible_features))
+c4.metric("Features", len(visible_features))
 c5.metric("Waters Present", len(filtered[filtered["Waters Present"] == "Yes"]))
 c6.metric("Consultants", filtered["Consultant"].replace("", pd.NA).dropna().nunique())
 c7.metric("Needs Review", len(filtered[filtered["Quality Flag"] != "Good"]))
+c8.metric("With Coordinates", len(filtered[(filtered["Latitude"] != "") & (filtered["Longitude"] != "")]))
+c9.metric("With Consultant", len(filtered[filtered["Consultant"] != ""]))
 
 st.divider()
 
@@ -466,8 +592,6 @@ with tabs[1]:
         "State",
         "Year",
         "JD Date",
-        "JD Type",
-        "USACE District",
         "Prepared By",
         "Approved By",
         "Applicant",
@@ -477,7 +601,6 @@ with tabs[1]:
         "Waters Present",
         "Determination Outcome",
         "Primary Determination Basis",
-        "Regulatory Framework",
         "TNW / Receiving Water",
         "Quality Flag",
         "PDF Link"
@@ -542,13 +665,13 @@ with tabs[3]:
             st.write("**Prepared By:**", selected_row["Prepared By"])
             st.write("**Approved By:**", selected_row["Approved By"])
             st.write("**JD Type:**", selected_row["JD Type"])
-            st.write("**Regulatory Framework:**", selected_row["Regulatory Framework"])
+            st.write("**Quality Flag:**", selected_row["Quality Flag"])
 
         with c3:
             st.write("**Primary Basis:**", selected_row["Primary Determination Basis"])
             st.write("**TNW / Receiving Water:**", selected_row["TNW / Receiving Water"])
             st.write("**Feature Type(s):**", selected_row["Feature Type(s)"])
-            st.write("**Quality Flag:**", selected_row["Quality Flag"])
+            st.write("**Waters Present:**", selected_row["Waters Present"])
 
         st.write("### AI Summary")
         st.write(selected_row["AI Summary"])
