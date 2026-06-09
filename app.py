@@ -9,6 +9,7 @@ import streamlit as st
 import folium
 from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
+from openai import OpenAI
 
 DB_PATH = "data/ajds.sqlite"
 
@@ -449,6 +450,129 @@ c9.metric("With Consultant", len(filtered[filtered["Consultant"] != ""]))
 
 st.divider()
 
+def build_search_text(row):
+    return " ".join([
+        str(row.get("JD ID", "")),
+        str(row.get("Project Name", "")),
+        str(row.get("County", "")),
+        str(row.get("State", "")),
+        str(row.get("Applicant", "")),
+        str(row.get("Consultant", "")),
+        str(row.get("Feature Type(s)", "")),
+        str(row.get("Feature Status(es)", "")),
+        str(row.get("Waters Present", "")),
+        str(row.get("Determination Outcome", "")),
+        str(row.get("Primary Determination Basis", "")),
+        str(row.get("TNW / Receiving Water", "")),
+        str(row.get("AI Summary", "")),
+        str(row.get("Jurisdictional Reasoning", "")),
+    ]).lower()
+
+
+def retrieve_relevant_records(question, df, max_records=10):
+    question_terms = [
+        term.lower().strip()
+        for term in question.split()
+        if len(term.strip()) > 2
+    ]
+
+    scored_rows = []
+
+    for _, row in df.iterrows():
+        search_text = build_search_text(row)
+        score = sum(1 for term in question_terms if term in search_text)
+
+        if score > 0:
+            scored_rows.append((score, row))
+
+    scored_rows = sorted(scored_rows, key=lambda x: x[0], reverse=True)
+
+    if scored_rows:
+        return [row for _, row in scored_rows[:max_records]]
+
+    return [row for _, row in df.head(max_records).iterrows()]
+
+
+def ask_database(question, relevant_rows, features_df):
+    client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+    context_blocks = []
+
+    for row in relevant_rows:
+        jd_id = row["JD ID"]
+
+        related_features = features_df[
+            features_df["JD ID"] == jd_id
+        ] if not features_df.empty else pd.DataFrame()
+
+        features_text = ""
+
+        if not related_features.empty:
+            features_text = related_features[
+                [
+                    "Feature ID",
+                    "Feature Type",
+                    "Jurisdictional Status",
+                    "Basis",
+                    "Reasoning"
+                ]
+            ].to_string(index=False)
+
+        context_blocks.append(
+            f"""
+JD ID: {row['JD ID']}
+County: {row['County']}
+State: {row['State']}
+Year: {row['Year']}
+Project Name: {row['Project Name']}
+Applicant: {row['Applicant']}
+Consultant: {row['Consultant']}
+Prepared By: {row['Prepared By']}
+Approved By: {row['Approved By']}
+Feature Types: {row['Feature Type(s)']}
+Feature Statuses: {row['Feature Status(es)']}
+Waters Present: {row['Waters Present']}
+Determination Outcome: {row['Determination Outcome']}
+Primary Basis: {row['Primary Determination Basis']}
+TNW / Receiving Water: {row['TNW / Receiving Water']}
+AI Summary: {row['AI Summary']}
+Jurisdictional Reasoning: {row['Jurisdictional Reasoning']}
+PDF Link: {row['PDF Link']}
+
+Extracted Features:
+{features_text}
+"""
+        )
+
+    context = "\n\n---\n\n".join(context_blocks)
+
+    prompt = f"""
+You are an assistant for an unofficial USACE Galveston District AJD database.
+
+Answer the user's question using ONLY the database records provided below.
+
+Rules:
+- Do not make official legal or regulatory conclusions.
+- Say "Based on the extracted database records" when answering.
+- Cite relevant JD IDs.
+- Include PDF links when useful.
+- If the records do not answer the question, say so.
+- Be concise but useful.
+
+User question:
+{question}
+
+Database records:
+{context}
+"""
+
+    response = client.responses.create(
+        model="gpt-4o-mini",
+        input=prompt
+    )
+
+    return response.output_text
+
 st.subheader("AJD Map")
 
 map_df = filtered.copy()
@@ -530,6 +654,7 @@ tabs = st.tabs([
     "Feature Explorer",
     "Detail View",
     "Downloads",
+    "Ask the Database",
     "About / Methodology"
 ])
 
@@ -738,6 +863,84 @@ with tabs[4]:
     )
 
 with tabs[5]:
+    st.subheader("Ask the Database")
+
+    st.info(
+        "Ask questions about the currently filtered AJD database. "
+        "Answers are generated from extracted OCR/AI database records and should be verified against the original PDFs."
+    )
+
+    example_question = st.selectbox(
+        "Example questions",
+        [
+            "",
+            "Which AJDs involve non-jurisdictional wetlands?",
+            "Show me AJDs in Harris County with ditches.",
+            "Which determinations mention relatively permanent waters or RPWs?",
+            "Which consultants appear most often?",
+            "Find AJDs involving canals.",
+            "Which AJDs have jurisdictional waters present?"
+        ]
+    )
+
+    user_question = st.text_area(
+        "Ask a question",
+        value=example_question,
+        height=100
+    )
+
+    if st.button("Ask"):
+        if not user_question.strip():
+            st.warning("Please enter a question.")
+        else:
+            try:
+                with st.spinner("Searching the database and generating an answer..."):
+                    relevant_rows = retrieve_relevant_records(
+                        user_question,
+                        filtered,
+                        max_records=12
+                    )
+
+                    answer = ask_database(
+                        user_question,
+                        relevant_rows,
+                        visible_features
+                    )
+
+                st.write("### Answer")
+                st.write(answer)
+
+                st.write("### Records Used")
+                used_df = pd.DataFrame(relevant_rows)
+
+                display_cols = [
+                    "JD ID",
+                    "County",
+                    "State",
+                    "Determination Outcome",
+                    "Feature Type(s)",
+                    "Consultant",
+                    "PDF Link"
+                ]
+
+                st.dataframe(
+                    used_df[display_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "PDF Link": st.column_config.LinkColumn("PDF Link")
+                    }
+                )
+
+            except KeyError:
+                st.error(
+                    "OpenAI API key is missing. Add OPENAI_API_KEY to Streamlit Secrets."
+                )
+            except Exception as e:
+                st.error("Something went wrong while answering the question.")
+                st.write(e)
+
+with tabs[6]:
     st.header("About / Methodology")
 
     st.markdown(

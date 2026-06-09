@@ -181,3 +181,4 @@ cython_debug/
 .cursorindexingignore
 chrome_profile_for_downloads/
 pdfs/
+.streamlit/secrets.toml
